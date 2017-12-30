@@ -1,6 +1,11 @@
 package goblkid
 
-import "io"
+import (
+	"encoding/binary"
+	"io"
+
+	"github.com/lunixbochs/struc"
+)
 
 type ProbeUsage int
 
@@ -52,4 +57,9 @@ type ProbeInfo struct {
 	SecType    string
 
 	Version string
+}
+
+func (info *ProbeInfo) GetSuperBlock(magic MagicInfo, sb interface{}) {
+	info.DeviceReader.Seek(int64(magic.SuperblockKbOffset<<10), io.SeekStart)
+	struc.UnpackWithOrder(info.DeviceReader, sb, binary.LittleEndian)
 }
