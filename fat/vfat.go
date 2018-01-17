@@ -14,16 +14,20 @@ var Chain = goblkid.Chain{
 }
 
 func vfatProbe(info *goblkid.ProbeInfo, magic goblkid.MagicInfo) bool {
-	var ms msdos_super_block
-	var vs vfat_super_block
-	info.GetSuperBlock(magic, &ms)
-	info.GetSuperBlock(magic, &vs)
-
-	if !isFATValidSuperblock(&ms, &vs, magic) {
+	_, err := info.DeviceReader.Seek(int64(magic.SuperblockKbOffset<<10), io.SeekStart)
+	if err != nil {
 		return false
 	}
-	fat_size := fatSize(&ms, &vs)
-	cluster_count := fatClusterCount(&ms, &vs)
+	ms, vs, err := vfatGetSuperblock(info.DeviceReader)
+	if err != nil {
+		return false
+	}
+
+	if !isFATValidSuperblock(ms, vs, magic) {
+		return false
+	}
+	fat_size := fatSize(ms, vs)
+	cluster_count := fatClusterCount(ms, vs)
 
 	version := ""
 	if ms.FatLength != 0 {
@@ -193,39 +197,56 @@ var FATProber = goblkid.Prober{
 	},
 }
 
-/* Yucky misaligned values */
-type vfat_super_block struct {
-	/* 00*/ Ignored [3]uint8
-	/* 03*/ Sysid [8]uint8
-	/* 0b*/ SectorSize [2]uint8
-	/* 0d*/ ClusterSize uint8
-	/* 0e*/ Reserved uint16
-	/* 10*/ Fats uint8
-	/* 11*/ DirEntries uint16
-	/* 13*/ Sectors uint16
-	/* 15*/ Media uint8
-	/* 16*/ FatLength uint16
-	/* 18*/ SecsTrack uint16
-	/* 1a*/ Heads uint16
-	/* 1c*/ Hidden uint32
-	/* 20*/ TotalSect uint32
-	/* 24*/ Fat32Length uint32
-	/* 28*/ Flags uint16
-	/* 2a*/ Version [2]uint8
-	/* 2c*/ RootCluster uint32
-	/* 30*/ FsinfoSector uint16
-	/* 32*/ BackupBoot uint16
-	/* 34*/ Reserved2 [6]uint16
-	/* 40*/ Unknown [3]uint8
-	/* 43*/ Serno [4]uint8
-	/* 47*/ Label [11]uint8
-	/* 52*/ Magic [8]uint8
-	/* 5a*/ Dummy2 [0x1fe - 0x5a]uint8
-	/*1fe*/ Pmagic [2]uint8
+const SuperblockSize = 512
+
+func vfatGetSuperblock(r io.Reader) (*msdos_super_block, *vfat_super_block, error) {
+	buf := make([]byte, 512)
+	if _, err := io.ReadAtLeast(r, buf, SuperblockSize); err != nil {
+		return nil, nil, err
+	}
+	common := superblock_common{}
+	copy(common.Ignored[:], buf[:3])
+	copy(common.Sysid[:], buf[3:0xb])
+	common.SectorSize = binary.LittleEndian.Uint16(buf[0x0b:0x0d])
+	common.ClusterSize = buf[0x0d]
+	common.Reserved = binary.LittleEndian.Uint16(buf[0x0e:0x10])
+	common.Fats = buf[0x10]
+	common.DirEntries = binary.LittleEndian.Uint16(buf[0x11:0x13])
+	common.Sectors = binary.LittleEndian.Uint16(buf[0x13:0x15])
+	common.Media = buf[0x15]
+	common.FatLength = binary.LittleEndian.Uint16(buf[0x16:0x18])
+	common.SecsTrack = binary.LittleEndian.Uint16(buf[0x18:0x1a])
+	common.Heads = binary.LittleEndian.Uint16(buf[0x1a:0x1c])
+	common.Hidden = binary.LittleEndian.Uint32(buf[0x1c:0x20])
+	common.TotalSect = binary.LittleEndian.Uint32(buf[0x20:0x24])
+
+	ms := &msdos_super_block{superblock_common: common}
+	copy(ms.Unknown[:], buf[0x24:0x24+3])
+	copy(ms.Serno[:], buf[0x27:0x2b])
+	copy(ms.Label[:], buf[0x2b:0x36])
+	copy(ms.Magic[:], buf[0x36:0x3e])
+	copy(ms.Dummy2[:], buf[0x3e:0x1fe])
+	copy(ms.Pmagic[:], buf[0x1fe:0x200])
+
+	vs := &vfat_super_block{superblock_common: common}
+	vs.Fat32Length = binary.LittleEndian.Uint32(buf[0x24:0x28])
+	vs.Flags = binary.LittleEndian.Uint16(buf[0x28:0x2a])
+	vs.Version = binary.LittleEndian.Uint16(buf[0x2a:0x2c])
+	vs.RootCluster = binary.LittleEndian.Uint32(buf[0x2c:0x30])
+	vs.FsinfoSector = binary.LittleEndian.Uint16(buf[0x30:0x32])
+	vs.BackupBoot = binary.LittleEndian.Uint16(buf[0x32:0x34])
+	copy(vs.Reserved2[:], buf[0x34:0x40])
+	copy(vs.Unknown[:], buf[0x40:0x43])
+	copy(vs.Serno[:], buf[0x43:0x47])
+	copy(vs.Label[:], buf[0x47:0x52])
+	copy(vs.Magic[:], buf[0x52:0x5a])
+	copy(vs.Dummy2[:], buf[0x5a:0x1fe])
+	copy(vs.Pmagic[:], buf[0x1fe:0x200])
+
+	return ms, vs, nil
 }
 
-/* Yucky misaligned values */
-type msdos_super_block struct {
+type superblock_common struct {
 	/* 00*/ Ignored [3]uint8
 	/* 03*/ Sysid [8]uint8
 	/* 0b*/ SectorSize uint16
@@ -238,10 +259,32 @@ type msdos_super_block struct {
 	/* 16*/ FatLength uint16 /* Sectors per FAT */
 	/* 18*/ SecsTrack uint16
 	/* 1a*/ Heads uint16
-	/* 1c*/ Hidden uint32
-	/* V3 BPB */
+	/* 1c*/ Hidden uint32 /* V3 BPB */
 	/* 20*/
-	TotalSect uint32 /* iff ms_sectors == 0 */
+	TotalSect uint32 /* iff ms.Sectors == 0 */
+}
+
+/* Yucky misaligned values */
+type vfat_super_block struct {
+	superblock_common
+	/* 24*/ Fat32Length uint32
+	/* 28*/ Flags uint16
+	/* 2a*/ Version uint16
+	/* 2c*/ RootCluster uint32
+	/* 30*/ FsinfoSector uint16
+	/* 32*/ BackupBoot uint16
+	/* 34*/ Reserved2 [12]uint8
+	/* 40*/ Unknown [3]uint8
+	/* 43*/ Serno [4]uint8
+	/* 47*/ Label [11]uint8
+	/* 52*/ Magic [8]uint8
+	/* 5a*/ Dummy2 [0x1fe - 0x5a]uint8
+	/*1fe*/ Pmagic [2]uint8
+}
+
+/* Yucky misaligned values */
+type msdos_super_block struct {
+	superblock_common
 	/* V4 BPB */
 	/* 24*/
 	Unknown [3]uint8 /* Phys drive no., resvd, V4 sig (0x29) */
